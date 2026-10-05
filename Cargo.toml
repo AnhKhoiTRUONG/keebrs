@@ -9,46 +9,57 @@ name = "split_esp32"
 path = "./src/bin/main.rs"
 
 [dependencies]
-esp-hal = { version = "~1.1.0", features = ["esp32c6", "unstable"] }
+#for lib
+embassy-futures = "0.1.2"
+embassy-time = "0.5.0"
+embedded-io = "0.7.1"
+embedded-io-async = "0.7.0"
+critical-section = "1.2.0"
+static_cell = "2.1.1"
+
+defmt = { version = "1.0.1", optional = true }
+log = { version = "0.4" }
+serde = { version = "1.0.228", default-features = false, features = [
+  "derive",
+], optional = true }
+
+embassy-executor = "0.10.0"
+esp-bootloader-esp-idf = { version = "0.5.0", features = ["esp32c6"] }
+esp-hal = { version = "1.1.0", features = ["esp32c6", "unstable"] }
+esp-alloc = "0.10.0"
+esp-println = { version = "0.17.0", features = ["esp32c6", "log-04"] }
+esp-radio = { git = "https://github.com/embassy-rs/esp-hal.git", rev = "7af0919e56e8298a7cb429da7f078757e350d842", default-features = false, features = [
+  "ble",
+  "log-04",
+  "esp32c6",
+  "unstable",
+] }
+
 
 esp-rtos = { version = "0.3.0", features = [
   "embassy",
   "esp-alloc",
   "esp-radio",
   "esp32c6",
-] }
-
-esp-bootloader-esp-idf = { version = "0.5.0", features = ["esp32c6"] }
-
-# bt-hci = "0.8.0"
-embassy-executor = { version = "0.10.0", features = [] }
-embassy-time = "0.5.0"
-embedded-io = "0.7.1"
-embedded-io-async = "0.7.0"
-esp-alloc = "0.10.0"
-esp-radio = { git = "https://github.com/embassy-rs/esp-hal.git", rev = "7af0919e56e8298a7cb429da7f078757e350d842", default-features = false, features = [
-  "ble",
-  "esp-alloc",
-  "esp32c6",
-  "unstable",
+  "log-04",
 ] }
 trouble-host = { git = "https://github.com/embassy-rs/trouble.git", features = [
   "gatt",
+  "security",
+  "serde",
 ] }
-
-critical-section = "1.2.0"
-static_cell = "2.1.1"
-embassy-futures = "0.1.2"
-esp-println = { version = "0.17.0", features = ["esp32c6"] }
-embassy-sync = "0.8.0"
-rand_chacha = { version = "0.3", default-features = false }
 embassy-crypto-rustcrypto = { git = "https://github.com/embassy-rs/embassy.git", rev = "bd35bd7a7d19147c8bcae9c2eda99b25e597294c", features = [
   "embassy-crypto-aes128-ecb",
   "embassy-crypto-aes128-cmac",
   "embassy-crypto-p256-ecdh",
 ] }
 embassy-crypto = { git = "https://github.com/embassy-rs/embassy.git", rev = "bd35bd7a7d19147c8bcae9c2eda99b25e597294c" }
-esp-sync = { version = "0.2.1", features = ["esp32c6"] }
+embassy-sync = "0.8.0"
+rand_chacha = { version = "0.3", default-features = false }
+# esp-sync = { version = "0.2.1", features = ["esp32c6"] }
+
+esp-storage = "0.9.0"
+embassy-embedded-hal = "0.6.0"
 
 # For fine tuning these settings, please refer to https://doc.rust-lang.org/cargo/reference/profiles.html
 [profile.dev]

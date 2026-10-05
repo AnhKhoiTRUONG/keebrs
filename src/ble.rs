@@ -1,50 +1,83 @@
 use embassy_futures::join::join;
 use embassy_futures::select::select;
-use embassy_time::Timer;
-use esp_println::println;
+use esp_hal::gpio::Input;
+use log::{info, warn};
 use trouble_host::prelude::*; // Added this to fix the macro error
 
 /// Max number of connections
 const CONNECTIONS_MAX: usize = 1;
 
 /// Max number of L2CAP channels.
-const L2CAP_CHANNELS_MAX: usize = 2; // Signal + att
+const L2CAP_CHANNELS_MAX: usize = 3; // Signal + att
+
+const REPORT_MAP: &[u8] = &[
+    0x05, 0x01, //Usage Page (Generic Desktop)
+    0x09, 0x06, //Usage (Keyboard)
+    0xa1, 0x01, //Collection (Application)
+    0x05, 0x07, //Usage Page (Keyboard)
+    0x19, 0xe0, //Usage Minimum (Keyboard LeftControl)
+    0x29, 0xe7, //Usage Maximum (Keyboard Right GUI)
+    0x15, 0x00, //Logical Minimum (0)
+    0x25, 0x01, //Logical Maximum (1)
+    0x75, 0x01, //Report Size (1)
+    0x95, 0x08, //Report Count (8)
+    0x81, 0x02, //Input (Data, Variable, Absolute) Modifier byte
+    0x95, 0x01, //Report Count (1)
+    0x75, 0x08, //Report Size (8)
+    0x81, 0x01, //Input (Constant) Reserved byte
+    0x95, 0x06, //Report Count (6)
+    0x75, 0x08, //Report Size (8)
+    0x15, 0x00, //Logical Minimum (0)
+    0x25, 0x65, //Logical Maximum (101)
+    0x05, 0x07, //Usage Page (Key Codes)
+    0x19, 0x00, //   Usage Minimum (0)
+    0x29, 0x65, //   Usage Maximum (101)
+    0x81, 0x00, //   Input (Data, Array) - 6 key slots
+    0xc0, //End Collection
+];
 
 // GATT Server definition
 #[gatt_server]
 struct Server {
-    sensor_service: SensorService,
+    hid_service: HidService,
 }
 
-/// Battery service
-#[gatt_service(uuid = "a9c81b72-0f7a-4c59-b0a8-425e3bcf0a0e")]
-struct SensorService {
-    #[characteristic(uuid = "13c0ef83-09bd-4767-97cb-ee46224ae6db", read, notify)]
-    sensor_data: u8,
-
-    #[characteristic(uuid = "c79b2ca7-f39d-4060-8168-816fa26737b7", write, read)]
-    sensor_settings: bool,
+#[gatt_service(uuid = service::HUMAN_INTERFACE_DEVICE)]
+struct HidService {
+    //0x03 means (remote wake 0x01 + 0x02 normally connectable)
+    #[characteristic(uuid = "2A4A", read, value = [0x11, 0x01, 0x00, 0x03])]
+    hid_info: [u8; 4],
+    #[characteristic(uuid = "2A4B", read, value = REPORT_MAP)]
+    report_map: &'static [u8],
+    #[characteristic(uuid = "2A4C", write_without_response)]
+    hid_control_point: u8,
+    #[characteristic(uuid = "2A4D", read, notify)]
+    #[descriptor(uuid = "2908", read, value = [0x00, 0x01])]
+    input_report: [u8; 8],
+    #[characteristic(uuid = "2A4E", read, write_without_response, value = 1)]
+    protocol_mode: u8,
 }
 
 /// Run the BLE stack.
-pub async fn run<C>(controller: C)
+pub async fn run<C>(controller: C, mut button: &mut Input<'_>)
 where
     C: Controller,
 {
     // Using a fixed "random" address can be useful for testing. In real scenarios, one would
     // use e.g. the MAC 6 byte array as the address (how to get that varies by the platform).
-    let address: Address = Address::random([0xff, 0x8f, 0x1a, 0x05, 0xe4, 0xff]);
-    println!("Our address = {:?}", address);
+    let address: Address = Address::random([0xff, 0x8f, 0x1a, 0x05, 0xe4, 0xee]);
+    info!("Our address = {:?}", address);
 
     let mut resources: HostResources<DefaultPacketPool, CONNECTIONS_MAX, L2CAP_CHANNELS_MAX> =
         HostResources::new();
     let stack = trouble_host::new(controller, &mut resources)
         .set_random_address(address)
+        .set_io_capabilities(IoCapabilities::NoInputNoOutput)
         .build();
     let runner = stack.runner();
     let mut peripheral = stack.peripheral();
 
-    println!("Starting advertising and GATT service");
+    info!("Starting advertising and GATT service");
     let server = Server::new_with_config(GapConfig::Peripheral(PeripheralConfig {
         name: "KEEb",
         appearance: &appearance::human_interface_device::KEYBOARD,
@@ -56,11 +89,13 @@ where
             match advertise("Keeb", &mut peripheral, &server).await {
                 Ok(conn) => {
                     // set up tasks when the connection is established to a central, so they don't run when no one is connected.
+                    conn.raw().set_bondable(true).unwrap();
                     let a = gatt_events_task(&server, &conn);
-                    let b = custom_task(&server, &conn, &stack);
+                    let b = custom_task(&server, &conn, &stack, &mut button);
                     // run until any task ends (usually because the connection has been closed),
                     // then return to advertising state.
                     select(a, b).await;
+                    // a.await;
                 }
                 Err(e) => {
                     #[cfg(feature = "defmt")]
@@ -91,68 +126,32 @@ async fn gatt_events_task<P: PacketPool>(
     server: &Server<'_>,
     conn: &GattConnection<'_, '_, P>,
 ) -> Result<(), Error> {
-    let level = server.sensor_service.sensor_data;
-    let status_handle = server.sensor_service.sensor_settings.handle;
-    let mut status = false;
     let reason = loop {
         match conn.next().await {
             GattConnectionEvent::Disconnected { reason } => break reason,
-            GattConnectionEvent::Gatt { event } => {
-                let reply = match event {
-                    GattEvent::Read(event) => {
-                        println!("[gatt] Received event handle: {:?}", event.handle());
-                        println!("level handle: {}", level.handle);
-                        if event.handle() == level.handle {
-                            let value = conn.get(&level);
-                            println!("[gatt] Read Event to Level Characteristic: {:?}", value);
-                            event.accept()
-                        } else if event.handle() == status_handle {
-                            println!("Im here?");
-                            event.accept_unprocessed(&status)
-                        } else {
-                            event.accept()
-                        }
-                    }
-                    GattEvent::Write(event) => {
-                        if event.handle() == level.handle {
-                            event.with_data(|offset, data| {
-                                println!(
-                                    "[gatt] Write Event to Level Characteristic at {}: {:?}",
-                                    offset, data
-                                )
-                            });
-                            event.accept()
-                        } else if event.handle() == status_handle {
-                            match event.validate(1, 1) {
-                                Ok(()) => {
-                                    event.with_data(|offset, data| {
-                                        if data.len() == 1 {
-                                            // If data.len() is 1, offset must be 0 or else validate would have errored
-                                            assert!(offset == 0);
-                                            status = data[0] != 0;
-                                        }
-                                    });
-                                    event.accept_unprocessed()
-                                }
-                                Err(err) => event.reject(err),
-                            }
-                        } else {
-                            event.accept()
-                        }
-                    }
-                    _ => event.accept(),
-                };
-                // This step is also performed at drop(), but writing it explicitly is necessary
-                // in order to ensure reply is sent.
-                match reply {
-                    Ok(reply) => reply.send().await,
-                    Err(e) => println!("[gatt] error sending response: {:?}", e),
-                };
+            GattConnectionEvent::PairingComplete {
+                security_level,
+                bond,
+            } => {
+                info!("Paired with security level: {:?}", security_level);
+                if let Some(bond) = bond {
+                    // Persist the bond information (see Bonding section)
+                }
             }
-            _ => {} // ignore other Gatt Connection Events
+            GattConnectionEvent::Gatt { event } => {
+                info!("[GATT] event: {:?}", event);
+                match event.accept() {
+                    Ok(reply) => {
+                        let _ = reply.send().await;
+                    }
+                    Err(e) => warn!("[gatt] error accepting event: {:?}", e),
+                }
+            }
+
+            _ => {}
         }
     };
-    println!("[gatt] disconnected: {:?}", reason);
+    info!("[gatt] disconnected");
     Ok(())
 }
 
@@ -166,7 +165,7 @@ async fn advertise<'values, 'server, C: Controller>(
     let len = AdStructure::encode_slice(
         &[
             AdStructure::Flags(LE_GENERAL_DISCOVERABLE | BR_EDR_NOT_SUPPORTED),
-            AdStructure::IncompleteServiceUuids16(&[[0x0f, 0x18]]),
+            AdStructure::CompleteServiceUuids16(&[[0x12, 0x18]]),
             AdStructure::CompleteLocalName(name.as_bytes()),
         ],
         &mut advertiser_data[..],
@@ -180,9 +179,9 @@ async fn advertise<'values, 'server, C: Controller>(
             },
         )
         .await?;
-    println!("[adv] advertising");
+    info!("[adv] advertising");
     let conn = advertiser.accept().await?.with_attribute_server(server)?;
-    println!("[adv] connection established");
+    info!("[adv] connection established");
     Ok(conn)
 }
 
@@ -194,23 +193,26 @@ async fn custom_task<C: Controller, P: PacketPool>(
     server: &Server<'_>,
     conn: &GattConnection<'_, '_, P>,
     stack: &Stack<'_, C, P>,
+    button: &mut Input<'_>,
 ) {
     let mut tick: u8 = 0;
-    let level = server.sensor_service.sensor_data;
+    let input_rep = server.hid_service.input_report;
+    let press_report: [u8; 8] = [0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00];
+
+    let release_report: [u8; 8] = [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+
     loop {
-        tick = tick.wrapping_add(1);
-        println!("[custom_task] notifying connection of tick {}", tick);
-        if level.notify(conn, &tick, true).await.is_err() {
-            println!("[custom_task] error notifying connection");
-            break;
-        };
-        // read RSSI (Received Signal Strength Indicator) of the connection.
-        if let Ok(rssi) = conn.raw().rssi(stack).await {
-            println!("[custom_task] RSSI: {:?}", rssi);
-        } else {
-            println!("[custom_task] error getting RSSI");
-            break;
-        };
-        Timer::after_secs(2).await;
+        info!("BEFORE PRESS");
+        button.wait_for_falling_edge().await;
+        let r = input_rep.notify(conn, &press_report, false).await;
+
+        info!("AFTER PRESS: {:?}", r);
+
+        info!("BEFORE RELEASE");
+
+        button.wait_for_rising_edge().await;
+        let r = input_rep.notify(conn, &release_report, false).await;
+
+        info!("AFTER RELEASE: {:?}", r);
     }
 }
