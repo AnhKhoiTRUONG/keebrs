@@ -1,0 +1,216 @@
+use embassy_futures::join::join;
+use embassy_futures::select::select;
+use embassy_time::Timer;
+use esp_println::println;
+use trouble_host::prelude::*; // Added this to fix the macro error
+
+/// Max number of connections
+const CONNECTIONS_MAX: usize = 1;
+
+/// Max number of L2CAP channels.
+const L2CAP_CHANNELS_MAX: usize = 2; // Signal + att
+
+// GATT Server definition
+#[gatt_server]
+struct Server {
+    sensor_service: SensorService,
+}
+
+/// Battery service
+#[gatt_service(uuid = "a9c81b72-0f7a-4c59-b0a8-425e3bcf0a0e")]
+struct SensorService {
+    #[characteristic(uuid = "13c0ef83-09bd-4767-97cb-ee46224ae6db", read, notify)]
+    sensor_data: u8,
+
+    #[characteristic(uuid = "c79b2ca7-f39d-4060-8168-816fa26737b7", write, read)]
+    sensor_settings: bool,
+}
+
+/// Run the BLE stack.
+pub async fn run<C>(controller: C)
+where
+    C: Controller,
+{
+    // Using a fixed "random" address can be useful for testing. In real scenarios, one would
+    // use e.g. the MAC 6 byte array as the address (how to get that varies by the platform).
+    let address: Address = Address::random([0xff, 0x8f, 0x1a, 0x05, 0xe4, 0xff]);
+    println!("Our address = {:?}", address);
+
+    let mut resources: HostResources<DefaultPacketPool, CONNECTIONS_MAX, L2CAP_CHANNELS_MAX> =
+        HostResources::new();
+    let stack = trouble_host::new(controller, &mut resources)
+        .set_random_address(address)
+        .build();
+    let runner = stack.runner();
+    let mut peripheral = stack.peripheral();
+
+    println!("Starting advertising and GATT service");
+    let server = Server::new_with_config(GapConfig::Peripheral(PeripheralConfig {
+        name: "KEEb",
+        appearance: &appearance::human_interface_device::KEYBOARD,
+    }))
+    .unwrap();
+
+    let _ = join(ble_task(runner), async {
+        loop {
+            match advertise("Keeb", &mut peripheral, &server).await {
+                Ok(conn) => {
+                    // set up tasks when the connection is established to a central, so they don't run when no one is connected.
+                    let a = gatt_events_task(&server, &conn);
+                    let b = custom_task(&server, &conn, &stack);
+                    // run until any task ends (usually because the connection has been closed),
+                    // then return to advertising state.
+                    select(a, b).await;
+                }
+                Err(e) => {
+                    #[cfg(feature = "defmt")]
+                    let e = defmt::Debug2Format(&e);
+                    panic!("[adv] error: {:?}", e);
+                }
+            }
+        }
+    })
+    .await;
+}
+
+async fn ble_task<C: Controller, P: PacketPool>(mut runner: Runner<'_, C, P>) {
+    loop {
+        if let Err(e) = runner.run().await {
+            #[cfg(feature = "defmt")]
+            let e = defmt::Debug2Format(&e);
+            panic!("[ble_task] error: {:?}", e);
+        }
+    }
+}
+
+/// Stream Events until the connection closes.
+///
+/// This function will handle the GATT events and process them.
+/// This is how we interact with read and write requests.
+async fn gatt_events_task<P: PacketPool>(
+    server: &Server<'_>,
+    conn: &GattConnection<'_, '_, P>,
+) -> Result<(), Error> {
+    let level = server.sensor_service.sensor_data;
+    let status_handle = server.sensor_service.sensor_settings.handle;
+    let mut status = false;
+    let reason = loop {
+        match conn.next().await {
+            GattConnectionEvent::Disconnected { reason } => break reason,
+            GattConnectionEvent::Gatt { event } => {
+                let reply = match event {
+                    GattEvent::Read(event) => {
+                        println!("[gatt] Received event handle: {:?}", event.handle());
+                        println!("level handle: {}", level.handle);
+                        if event.handle() == level.handle {
+                            let value = conn.get(&level);
+                            println!("[gatt] Read Event to Level Characteristic: {:?}", value);
+                            event.accept()
+                        } else if event.handle() == status_handle {
+                            println!("Im here?");
+                            event.accept_unprocessed(&status)
+                        } else {
+                            event.accept()
+                        }
+                    }
+                    GattEvent::Write(event) => {
+                        if event.handle() == level.handle {
+                            event.with_data(|offset, data| {
+                                println!(
+                                    "[gatt] Write Event to Level Characteristic at {}: {:?}",
+                                    offset, data
+                                )
+                            });
+                            event.accept()
+                        } else if event.handle() == status_handle {
+                            match event.validate(1, 1) {
+                                Ok(()) => {
+                                    event.with_data(|offset, data| {
+                                        if data.len() == 1 {
+                                            // If data.len() is 1, offset must be 0 or else validate would have errored
+                                            assert!(offset == 0);
+                                            status = data[0] != 0;
+                                        }
+                                    });
+                                    event.accept_unprocessed()
+                                }
+                                Err(err) => event.reject(err),
+                            }
+                        } else {
+                            event.accept()
+                        }
+                    }
+                    _ => event.accept(),
+                };
+                // This step is also performed at drop(), but writing it explicitly is necessary
+                // in order to ensure reply is sent.
+                match reply {
+                    Ok(reply) => reply.send().await,
+                    Err(e) => println!("[gatt] error sending response: {:?}", e),
+                };
+            }
+            _ => {} // ignore other Gatt Connection Events
+        }
+    };
+    println!("[gatt] disconnected: {:?}", reason);
+    Ok(())
+}
+
+/// Create an advertiser to use to connect to a BLE Central, and wait for it to connect.
+async fn advertise<'values, 'server, C: Controller>(
+    name: &'values str,
+    peripheral: &mut Peripheral<'values, C, DefaultPacketPool>,
+    server: &'server Server<'values>,
+) -> Result<GattConnection<'values, 'server, DefaultPacketPool>, BleHostError<C::Error>> {
+    let mut advertiser_data = [0; 31];
+    let len = AdStructure::encode_slice(
+        &[
+            AdStructure::Flags(LE_GENERAL_DISCOVERABLE | BR_EDR_NOT_SUPPORTED),
+            AdStructure::IncompleteServiceUuids16(&[[0x0f, 0x18]]),
+            AdStructure::CompleteLocalName(name.as_bytes()),
+        ],
+        &mut advertiser_data[..],
+    )?;
+    let advertiser = peripheral
+        .advertise(
+            &Default::default(),
+            Advertisement::ConnectableScannableUndirected {
+                adv_data: &advertiser_data[..len],
+                scan_data: &[],
+            },
+        )
+        .await?;
+    println!("[adv] advertising");
+    let conn = advertiser.accept().await?.with_attribute_server(server)?;
+    println!("[adv] connection established");
+    Ok(conn)
+}
+
+/// Example task to use the BLE notifier interface.
+/// This task will notify the connected central of a counter value every 2 seconds.
+/// It will also read the RSSI value every 2 seconds.
+/// and will stop when the connection is closed by the central or an error occurs.
+async fn custom_task<C: Controller, P: PacketPool>(
+    server: &Server<'_>,
+    conn: &GattConnection<'_, '_, P>,
+    stack: &Stack<'_, C, P>,
+) {
+    let mut tick: u8 = 0;
+    let level = server.sensor_service.sensor_data;
+    loop {
+        tick = tick.wrapping_add(1);
+        println!("[custom_task] notifying connection of tick {}", tick);
+        if level.notify(conn, &tick, true).await.is_err() {
+            println!("[custom_task] error notifying connection");
+            break;
+        };
+        // read RSSI (Received Signal Strength Indicator) of the connection.
+        if let Ok(rssi) = conn.raw().rssi(stack).await {
+            println!("[custom_task] RSSI: {:?}", rssi);
+        } else {
+            println!("[custom_task] error getting RSSI");
+            break;
+        };
+        Timer::after_secs(2).await;
+    }
+}
