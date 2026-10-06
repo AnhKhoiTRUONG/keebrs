@@ -17,11 +17,9 @@ embedded-io-async = "0.7.0"
 critical-section = "1.2.0"
 static_cell = "2.1.1"
 
-defmt = { version = "1.0.1", optional = true }
+defmt = { version = "1.0.1" }
 log = { version = "0.4" }
-serde = { version = "1.0.228", default-features = false, features = [
-  "derive",
-], optional = true }
+serde = { version = "1.0.228", default-features = false, features = ["derive"] }
 
 embassy-executor = "0.10.0"
 esp-bootloader-esp-idf = { version = "0.5.0", features = ["esp32c6"] }
@@ -58,8 +56,14 @@ embassy-sync = "0.8.0"
 rand_chacha = { version = "0.3", default-features = false }
 # esp-sync = { version = "0.2.1", features = ["esp32c6"] }
 
-esp-storage = "0.9.0"
+
+# Used by 'security' feature
+embedded-storage-async = { version = "0.4.1" }
+sequential-storage = { version = "7.1.0", features = ["postcard"] }
+
 embassy-embedded-hal = "0.6.0"
+esp-storage = { version = "0.9.0", features = ["embedded-storage"] }
+embedded-storage = "0.3.1"
 
 # For fine tuning these settings, please refer to https://doc.rust-lang.org/cargo/reference/profiles.html
 [profile.dev]

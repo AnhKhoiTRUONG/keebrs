@@ -1,7 +1,12 @@
+use core::ops::Range;
 use embassy_futures::join::join;
 use embassy_futures::select::select;
+use embedded_storage_async::nor_flash::NorFlash;
 use esp_hal::gpio::Input;
-use log::{info, warn};
+use log::{error, info, warn};
+use sequential_storage::cache::NoCache;
+use sequential_storage::map::{MapConfig, MapStorage, PostcardValue};
+use serde::{Deserialize, Serialize};
 use trouble_host::prelude::*; // Added this to fix the macro error
 
 /// Max number of connections
@@ -45,23 +50,47 @@ struct Server {
 #[gatt_service(uuid = service::HUMAN_INTERFACE_DEVICE)]
 struct HidService {
     //0x03 means (remote wake 0x01 + 0x02 normally connectable)
-    #[characteristic(uuid = "2A4A", read, value = [0x11, 0x01, 0x00, 0x03])]
+    #[characteristic(uuid = "2A4A", read, value = [0x11, 0x01, 0x00, 0x03], permissions(encrypted))]
     hid_info: [u8; 4],
-    #[characteristic(uuid = "2A4B", read, value = REPORT_MAP)]
+    #[characteristic(uuid = "2A4B", read, value = REPORT_MAP, permissions(encrypted))]
     report_map: &'static [u8],
-    #[characteristic(uuid = "2A4C", write_without_response)]
+    #[characteristic(uuid = "2A4C", write_without_response, permissions(encrypted))]
     hid_control_point: u8,
-    #[characteristic(uuid = "2A4D", read, notify)]
-    #[descriptor(uuid = "2908", read, value = [0x00, 0x01])]
+    #[characteristic(uuid = "2A4D", read, notify, permissions(encrypted))]
+    #[descriptor(uuid = "2908", read = encrypted, value = [0x00, 0x01])]
     input_report: [u8; 8],
-    #[characteristic(uuid = "2A4E", read, write_without_response, value = 1)]
+    #[descriptor(uuid = "2908", read = encrypted, value = [0x00, 0x02])]
+    #[characteristic(
+        uuid = "2a4d",
+        read,
+        write,
+        write_without_response,
+        permissions(encrypted)
+    )]
+    pub(crate) output_keyboard: [u8; 1],
+    #[characteristic(
+        uuid = "2A4E",
+        read,
+        write_without_response,
+        value = 1,
+        permissions(encrypted)
+    )]
     protocol_mode: u8,
 }
 
+#[derive(Serialize, Deserialize)]
+struct StoredBondInformation(BondInformation);
+impl<'a> PostcardValue<'a> for StoredBondInformation {}
+
 /// Run the BLE stack.
-pub async fn run<C>(controller: C, mut button: &mut Input<'_>)
-where
+pub async fn run<C, S>(
+    controller: C,
+    storage: &mut S,
+    storage_range: Range<u32>,
+    mut button: &mut Input<'_>,
+) where
     C: Controller,
+    S: NorFlash,
 {
     // Using a fixed "random" address can be useful for testing. In real scenarios, one would
     // use e.g. the MAC 6 byte array as the address (how to get that varies by the platform).
@@ -74,6 +103,21 @@ where
         .set_random_address(address)
         .set_io_capabilities(IoCapabilities::NoInputNoOutput)
         .build();
+
+    let mut map_storage =
+        MapStorage::<(), _, _>::new(storage, MapConfig::new(storage_range), NoCache::new());
+    let mut data_buffer = [0; 64];
+    let mut bond_stored = if let Some(StoredBondInformation(bond_info)) =
+        map_storage.fetch_item(&mut data_buffer, &()).await.unwrap()
+    {
+        info!("Bond stored. Adding to stack.");
+        stack.add_bond_information(bond_info).unwrap();
+        true
+    } else {
+        info!("No bond stored.");
+        false
+    };
+
     let runner = stack.runner();
     let mut peripheral = stack.peripheral();
 
@@ -90,11 +134,18 @@ where
                 Ok(conn) => {
                     // set up tasks when the connection is established to a central, so they don't run when no one is connected.
                     conn.raw().set_bondable(true).unwrap();
-                    let a = gatt_events_task(&server, &conn);
+                    let a = gatt_events_task(
+                        &mut map_storage,
+                        &mut data_buffer,
+                        &server,
+                        &conn,
+                        &mut bond_stored,
+                    );
                     let b = custom_task(&server, &conn, &stack, &mut button);
                     // run until any task ends (usually because the connection has been closed),
                     // then return to advertising state.
                     select(a, b).await;
+                    info!("Connection dropped");
                     // a.await;
                 }
                 Err(e) => {
@@ -122,9 +173,12 @@ async fn ble_task<C: Controller, P: PacketPool>(mut runner: Runner<'_, C, P>) {
 ///
 /// This function will handle the GATT events and process them.
 /// This is how we interact with read and write requests.
-async fn gatt_events_task<P: PacketPool>(
+async fn gatt_events_task<P: PacketPool, S: NorFlash>(
+    map_storage: &mut MapStorage<(), S, NoCache>,
+    data_buffer: &mut [u8],
     server: &Server<'_>,
     conn: &GattConnection<'_, '_, P>,
+    bond_stored: &mut bool,
 ) -> Result<(), Error> {
     let reason = loop {
         match conn.next().await {
@@ -133,10 +187,21 @@ async fn gatt_events_task<P: PacketPool>(
                 security_level,
                 bond,
             } => {
-                info!("Paired with security level: {:?}", security_level);
+                info!(
+                    "[gatt] Pairing complete with security level: {:?}",
+                    security_level
+                );
                 if let Some(bond) = bond {
-                    // Persist the bond information (see Bonding section)
+                    map_storage
+                        .store_item(data_buffer, &(), &StoredBondInformation(bond))
+                        .await
+                        .unwrap();
+                    *bond_stored = true;
+                    info!("Bond information stored");
                 }
+            }
+            GattConnectionEvent::PairingFailed(err) => {
+                error!("[gatt] pairing error: {:?}", err);
             }
             GattConnectionEvent::Gatt { event } => {
                 info!("[GATT] event: {:?}", event);

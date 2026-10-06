@@ -15,6 +15,7 @@ use esp_hal::gpio::{Input, InputConfig, Pull};
 use esp_hal::timer::timg::TimerGroup;
 use esp_println as _;
 use esp_radio::ble::controller::BleConnector;
+use esp_storage::FlashStorage;
 use trouble_host::prelude::*;
 
 #[path = "../ble.rs"]
@@ -65,15 +66,16 @@ async fn main(spawner: Spawner) -> ! {
     // find more examples https://github.com/embassy-rs/trouble/tree/main/examples/esp32
     let transport = BleConnector::new(peripherals.BT, Default::default()).unwrap();
     let ble_controller = ExternalController::<_, 1>::new(transport);
-    // let mut resources: HostResources<DefaultPacketPool, CONNECTIONS_MAX, L2CAP_CHANNELS_MAX> =
-    //     HostResources::new();
-    // let _stack = trouble_host::new(ble_controller, &mut resources);
 
-    // TODO: Spawn some tasks
-    // let _ = spawner;
+    let flash_storage = FlashStorage::new(peripherals.FLASH);
+    use embedded_storage::nor_flash::NorFlash;
+    let erase_size = <FlashStorage as NorFlash>::ERASE_SIZE as u32;
+    let capacity = flash_storage.capacity() as u32;
+    let storage_range = (capacity - erase_size * 2)..capacity;
+    let mut flash = embassy_embedded_hal::adapter::BlockingAsync::new(flash_storage);
 
     //To start the bluetooth stack
-    ble::run(ble_controller, &mut button).await;
+    ble::run(ble_controller, &mut flash, storage_range, &mut button).await;
 
     loop {
         Timer::after(Duration::from_secs(1)).await;
